@@ -49,17 +49,24 @@ class InvoicePipeline:
     def _extract_text_from_result(self, result):
         """Extracts text while injecting Y-coordinates to prevent table row bleeding."""
         extracted = []
+        confidences = []
         if result is None:
-            return ""
+            return "", 0.0
 
         # result is list of lines for a single image
         if result and isinstance(result[0], (list, tuple)) and len(result[0]) == 2:
             for line in result:
                 box = line[0]
                 text = line[1][0]
-                y_center = int((box[0][1] + box[2][1]) / 2)
+                conf = line[1][1]
+                y_center = self._safe_y_center(box)
+                if y_center is None:
+                    continue
                 extracted.append(f"[Y:{y_center:04d}] {text}")
-            return "\n".join(extracted)
+                if isinstance(conf, (int, float)):
+                    confidences.append(conf)
+            avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+            return "\n".join(extracted), avg_conf
 
         # result is list of pages (each a list of lines)
         for res in result:
@@ -67,18 +74,47 @@ class InvoicePipeline:
                 for line in res:
                     box = line[0]
                     text = line[1][0]
-                    y_center = int((box[0][1] + box[2][1]) / 2)
+                    conf = line[1][1]
+                    y_center = self._safe_y_center(box)
+                    if y_center is None:
+                        continue
                     extracted.append(f"[Y:{y_center:04d}] {text}")
-        return "\n".join(extracted)
+                    if isinstance(conf, (int, float)):
+                        confidences.append(conf)
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+        return "\n".join(extracted), avg_conf
 
     def _ocr_best_of(self, images):
         best_text = ""
+        best_conf = 0.0
         for img in images:
             result = self.ocr_engine.ocr(img, cls=True)
-            text = self._extract_text_from_result(result)
+            text, conf = self._extract_text_from_result(result)
             if len(text.strip()) > len(best_text.strip()):
                 best_text = text
-        return best_text
+                best_conf = conf
+        return best_text, best_conf
+
+    def _safe_y_center(self, box):
+        if not box or len(box) < 2:
+            return None
+        try:
+            y_values = []
+            for pt in box:
+                if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                    continue
+                y = pt[1]
+                if isinstance(y, (int, float)):
+                    y_values.append(y)
+                elif isinstance(y, (list, tuple)):
+                    for y_item in y:
+                        if isinstance(y_item, (int, float)):
+                            y_values.append(y_item)
+        except Exception:
+            return None
+        if not y_values:
+            return None
+        return int(sum(y_values) / len(y_values))
 
     def extract_text_from_native_pdf(self, file_path):
         print("Executing Fast Path (PyMuPDF)...")
@@ -214,21 +250,23 @@ class InvoicePipeline:
         file_ext = os.path.splitext(file_path)[1].lower()
         print(f"Detected extension: {file_ext}")
         raw_text = ""
+        ocr_conf = 0.0
         is_pdf = (file_ext == '.pdf')
 
         if file_ext in ['.jpg', '.jpeg', '.png', '.tiff']:
-            raw_text = self.extract_text_with_vision(file_path, debug=debug)
+            raw_text, ocr_conf = self.extract_text_with_vision(file_path, debug=debug)
         elif is_pdf:
             if force_ocr:
                 print("Force OCR enabled. Using vision engine for PDF...")
-                raw_text = self.extract_text_with_vision(file_path, debug=debug)
+                raw_text, ocr_conf = self.extract_text_with_vision(file_path, debug=debug)
             else:
                 if self.is_scanned_pdf(file_path):
                     print("PDF appears to be a scan. Using vision engine...")
-                    raw_text = self.extract_text_with_vision(file_path, debug=debug)
+                    raw_text, ocr_conf = self.extract_text_with_vision(file_path, debug=debug)
                 else:
                     print("Native PDF detected. Using text layer...")
                     raw_text = self.extract_text_from_native_pdf(file_path)
+                    ocr_conf = 1.0
         else:
             raise ValueError(f"Unsupported file format: {file_ext}")
 
@@ -244,7 +282,13 @@ class InvoicePipeline:
             return None
             
         # Pass the is_pdf flag down to the parser to determine which schema to use
-        return self.parse_to_json(raw_text, is_pdf=is_pdf)
+        parsed = self.parse_to_json(raw_text, is_pdf=is_pdf)
+        if parsed is None:
+            return None
+
+        parsed["ocr_confidence"] = round(ocr_conf, 4)
+        parsed["needs_review"] = ocr_conf < 0.75
+        return parsed
 
 
 if __name__ == "__main__":
