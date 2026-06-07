@@ -167,6 +167,7 @@ def create_staging_record(
         "x_payment_method": payload.get("payment_method") or "",
         "x_subtotal_amount": normalize_float(payload.get("subtotal_amount")),
         "x_tax_amount": normalize_float(payload.get("tax_amount")),
+        "x_tip_amount": normalize_float(payload.get("tip_amount")),
         "x_total_amount": normalize_float(payload.get("total_amount")),
         "x_authorized_amount": normalize_float(payload.get("authorized_amount")),
         "x_ocr_confidence": ocr_confidence,
@@ -188,16 +189,203 @@ def create_staging_record(
     return staging_id
 
 
+def approve_invoice(client: OdooClient, staging_id: int, review_notes: str = "Approved by OCR workflow") -> Any:
+    return client.execute_kw(
+        "x_invoice_staging",
+        "write",
+        [
+            [staging_id],
+            {
+                "x_status": "approved",
+                "x_review_notes": review_notes,
+            },
+        ],
+    )
+
+
+def get_or_create_vendor(client: OdooClient, vendor_name: str, tax_id: Optional[str] = None) -> int:
+    vendor_name = (vendor_name or "").strip()
+    if not vendor_name:
+        raise ValueError("Vendor name is required to create a vendor bill")
+
+    partner_ids = client.execute_kw(
+        "res.partner",
+        "search",
+        [[["name", "=", vendor_name]]],
+        {"limit": 1},
+    )
+    if partner_ids:
+        return partner_ids[0]
+
+    vals: Dict[str, Any] = {
+        "name": vendor_name,
+        "supplier_rank": 1,
+    }
+    if tax_id:
+        vals["vat"] = tax_id
+
+    return client.execute_kw("res.partner", "create", [vals])
+
+
+def create_vendor_bill_from_staging(
+    client: OdooClient,
+    staging_id: int,
+    expense_account_id: int,
+    staging_model: str = DEFAULT_STAGING_MODEL,
+    line_model: str = DEFAULT_LINE_MODEL,
+) -> int:
+    staging_records = client.execute_kw(
+        staging_model,
+        "read",
+        [[staging_id]],
+        {
+            "fields": [
+                "x_vendor_name",
+                "x_invoice_number",
+                "x_invoice_date",
+                "x_tax_id",
+                "x_line_ids",
+                "x_vendor_bill_id",
+                "x_status",
+                "x_tax_amount", 
+                "x_authorized_amount", 
+                "x_total_amount", 
+                "x_tip_amount"
+            ]
+        },
+    )
+    if not staging_records:
+        raise ValueError(f"Staging record not found: {staging_id}")
+
+    staging = staging_records[0]
+    existing_bill = staging.get("x_vendor_bill_id")
+    if existing_bill:
+        if isinstance(existing_bill, list) and existing_bill:
+            return existing_bill[0]
+        if isinstance(existing_bill, int):
+            return existing_bill
+
+    vendor_id = get_or_create_vendor(client, staging.get("x_vendor_name"), staging.get("x_tax_id"))
+
+    line_ids = staging.get("x_line_ids") or []
+    if not line_ids:
+        raise ValueError("Staging record has no lines to post")
+
+    lines = client.execute_kw(
+        line_model,
+        "read",
+        [line_ids],
+        {
+            "fields": [
+                "x_description",
+                "x_quantity",
+                "x_unit_price",
+                "x_total",
+            ]
+        },
+    )
+
+    invoice_lines = []
+    for line in lines:
+        qty = normalize_float(line.get("x_quantity"))
+        unit_price = normalize_float(line.get("x_unit_price"))
+        if qty <= 0:
+            qty = 1.0
+        if unit_price <= 0 and qty > 0:
+            unit_price = normalize_float(line.get("x_total")) / qty
+
+        invoice_lines.append(
+            (
+                0,
+                0,
+                {
+                    "name": line.get("x_description") or "OCR Line",
+                    "quantity": qty,
+                    "price_unit": unit_price,
+                    "account_id": expense_account_id,
+                },
+            )
+        )
+    
+    tax_amount = normalize_float(staging.get("x_tax_amount"))
+    if tax_amount > 0:
+            invoice_lines.append(
+            (
+                0,
+                0,
+                {
+                    "name": "Tax",
+                    "quantity": 1,
+                    "price_unit": tax_amount,
+                    "account_id": expense_account_id,
+                },
+            )
+        )
+
+    tip_amount = normalize_float(staging.get("x_tip_amount"))
+    if tip_amount > 0:
+            invoice_lines.append(
+            (
+                0,
+                0,
+                {
+                    "name": "Tip",
+                    "quantity": 1,
+                    "price_unit": tip_amount,
+                    "account_id": expense_account_id,
+                },
+            )
+        )
+
+
+    
+
+
+    move_vals = {
+        "move_type": "in_invoice",
+        "partner_id": vendor_id,
+        "invoice_date": staging.get("x_invoice_date") or False,
+        "ref": staging.get("x_invoice_number") or "",
+        "invoice_line_ids": invoice_lines,
+    }
+
+    bill_id = client.execute_kw("account.move", "create", [move_vals])
+
+    client.execute_kw(
+        staging_model,
+        "write",
+        [
+            [staging_id],
+            {
+                "x_status": "posted",
+                "x_vendor_bill_id": bill_id,
+                "x_review_notes": "Vendor bill created from staging record.",
+            },
+        ],
+    )
+
+    return bill_id
+
+
 def main() -> int:
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Upload extracted invoice JSON to Odoo staging model")
-    parser.add_argument("json_file", help="Path to extracted invoice JSON")
+    parser.add_argument("json_file", nargs="?", help="Path to extracted invoice JSON")
     parser.add_argument("--pdf", help="Optional path to source PDF to attach")
     parser.add_argument("--review-threshold", type=float, default=float(os.getenv("OCR_REVIEW_THRESHOLD", "0.75")))
     parser.add_argument("--staging-model", default=os.getenv("ODOO_STAGING_MODEL", DEFAULT_STAGING_MODEL))
     parser.add_argument("--line-model", default=os.getenv("ODOO_STAGING_LINE_MODEL", DEFAULT_LINE_MODEL))
+    parser.add_argument("--post-staging-id", type=int, help="Create vendor bill from an existing staging record ID")
+    # parser.add_argument(
+    #     "--expense-account-id",
+    #     type=int,
+    #     default=int(os.getenv("ODOO_DEFAULT_EXPENSE_ACCOUNT_ID", "600000")),
+    #     help="Expense account ID to use for all bill lines when posting from staging",
+    # )
     args = parser.parse_args()
+
+    default_expense_account_id = int(os.getenv("ODOO_DEFAULT_EXPENSE_ACCOUNT_ID", "0"))
 
     base_url = os.environ.get("ODOO_URL")
     db = os.environ.get("ODOO_DB")
@@ -209,8 +397,20 @@ def main() -> int:
             "Missing Odoo configuration. Set ODOO_URL, ODOO_DB, ODOO_LOGIN, and ODOO_API_KEY in .env"
         )
 
-    payload = load_json_payload(args.json_file)
     client = OdooClient(base_url=base_url, db=db, login=login, api_key=api_key)
+
+    if args.post_staging_id:
+        bill_id = create_vendor_bill_from_staging(
+            client=client,
+            staging_id=args.post_staging_id,
+            expense_account_id=default_expense_account_id,
+            staging_model=args.staging_model,
+            line_model=args.line_model,
+        )
+        print(json.dumps({"vendor_bill_id": bill_id, "status": "posted"}, indent=2))
+        return 0
+
+    payload = load_json_payload(args.json_file)
 
     staging_id = create_staging_record(
         client=client,
