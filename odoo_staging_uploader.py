@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import mimetypes
 
 try:
     from dotenv import load_dotenv
@@ -118,31 +119,34 @@ def calculate_payload_hash(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def upload_pdf_attachment(client: OdooClient, model: str, res_id: int, pdf_path: str) -> int:
-    if not pdf_path:
+def upload_file_attachment(client: OdooClient, model: str, res_id: int, file_path: str) -> int:
+    if not file_path:
         return 0
 
-    pdf_file = Path(pdf_path)
-    if not pdf_file.exists():
-        raise FileNotFoundError(f"PDF attachment not found: {pdf_path}")
+    source_file = Path(file_path)
+    if not source_file.exists():
+        raise FileNotFoundError(f"Attachment not found: {file_path}")
 
-    with open(pdf_file, "rb") as handle:
-        pdf_data = base64.b64encode(handle.read()).decode("ascii")
+    with open(source_file, "rb") as handle:
+        file_data = base64.b64encode(handle.read()).decode("ascii")
+
+    mimetype, _ = mimetypes.guess_type(source_file.name)
 
     attachment_id = client.execute_kw(
         "ir.attachment",
         "create",
         [
             {
-                "name": pdf_file.name,
+                "name": source_file.name,
                 "type": "binary",
-                "datas": pdf_data,
-                "mimetype": "application/pdf",
+                "raw": file_data,
+                "mimetype": mimetype or "application/octet-stream",
                 "res_model": model,
                 "res_id": res_id,
             }
         ],
     )
+
     return attachment_id
 
 
@@ -184,8 +188,17 @@ def create_staging_record(
     staging_id = client.execute_kw(staging_model, "create", [values])
 
     if pdf_path:
-        upload_pdf_attachment(client, staging_model, staging_id, pdf_path)
-
+        attachment_id = upload_file_attachment(client, staging_model, staging_id, pdf_path)
+        client.execute_kw(
+            staging_model, 
+            "write",
+            [
+                [staging_id],
+                {
+                    "x_invoice_upload":attachment_id
+                }
+            ]
+        )
     return staging_id
 
 
@@ -372,7 +385,7 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="Upload extracted invoice JSON to Odoo staging model")
     parser.add_argument("json_file", nargs="?", help="Path to extracted invoice JSON")
-    parser.add_argument("--pdf", help="Optional path to source PDF to attach")
+    parser.add_argument("--file", help="Optional path to source file to attach")
     parser.add_argument("--review-threshold", type=float, default=float(os.getenv("OCR_REVIEW_THRESHOLD", "0.75")))
     parser.add_argument("--staging-model", default=os.getenv("ODOO_STAGING_MODEL", DEFAULT_STAGING_MODEL))
     parser.add_argument("--line-model", default=os.getenv("ODOO_STAGING_LINE_MODEL", DEFAULT_LINE_MODEL))
@@ -415,7 +428,7 @@ def main() -> int:
     staging_id = create_staging_record(
         client=client,
         payload=payload,
-        pdf_path=args.pdf,
+        pdf_path=args.file,
         staging_model=args.staging_model,
         line_model=args.line_model,
         review_threshold=args.review_threshold,

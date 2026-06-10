@@ -20,6 +20,14 @@ if not api_key:
 # Initialize the Mistral client globally
 mistral_client = Mistral(api_key=api_key)
 
+def normalize_float(value):
+    try:
+        if value is None:
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
 class InvoicePipeline:
     def __init__(self):
         print("Initializing stable OCR engine (PaddleOCR 2.8.1 / PaddlePaddle 2.6.2)...")
@@ -172,58 +180,304 @@ class InvoicePipeline:
         
         # Define base instructions regarding the spatial coordinates
         system_instruction = """
-        Extract the invoice details from the raw text below.
-        CRITICAL INSTRUCTIONS FOR LINE ITEMS:
-        1. The text includes vertical Y-coordinates (e.g., [Y:0150]). Use these to group items that belong on the same row.
-        2. Descriptions often span multiple lines. Do not cut them off prematurely.
-        3. You must reply ONLY with a valid JSON object matching the requested schema, nothing else.
+            You are an expert Accounts Payable invoice extraction system.
+    
+            Your job is to convert OCR text into accurate structured invoice JSON.
+    
+            The OCR text contains vertical coordinates in the format:
+    
+            [Y:0123]
+    
+            These coordinates represent the approximate vertical position of text on the page and MUST be used to reconstruct tables and multi-line descriptions.
+    
+            ==================================================
+            GENERAL RULES
+            ==================================================
+    
+            1. Return ONLY valid JSON.
+            2. Do not include explanations.
+            3. Do not include markdown.
+            4. Do not invent values.
+            5. Use null when a value is genuinely unavailable.
+            6. Dates must be returned as YYYY-MM-DD.
+            7. Monetary values must be numeric floats.
+            8. Quantities must be numeric floats.
+            9. Detect invoice currency and return ISO code:
+               USD, EUR, GBP, INR, CAD, AUD, JPY, CHF, etc.
+    
+            ==================================================
+            VENDOR INFORMATION
+            ==================================================
+    
+            Extract:
+    
+            - vendor_name
+            - invoice_number
+            - invoice_date
+            - tax_id
+            - payment_method
+    
+            Vendor name is the seller/supplier.
+    
+            Ignore:
+            - customer information
+            - buyer information
+            - shipping addresses
+    
+            ==================================================
+            TOTALS EXTRACTION
+            ==================================================
+    
+            Extract separately:
+    
+            - subtotal_amount
+            - tax_amount
+            - tip_amount
+            - total_amount
+            - authorized_amount
+    
+            Definitions:
+    
+            subtotal_amount:
+                Amount before tax.
+    
+            tax_amount:
+                VAT/GST/Sales Tax amount.
+    
+            tip_amount:
+                Gratuity/tip amount.
+    
+            total_amount:
+                Final invoice amount.
+    
+            authorized_amount:
+                Final charged card amount.
+                Often appears on receipts.
+    
+            ==================================================
+            TAX DETECTION
+            ==================================================
+    
+            Look for labels such as:
+    
+            VAT
+            GST
+            Sales Tax
+            Tax
+            MwSt
+            Umsatzsteuer
+            IVA
+            TVA
+    
+            Examples:
+    
+            VAT 19%
+            Tax 8.25%
+            GST
+    
+            Extract the actual tax amount separately.
+    
+            Never create tax as a line item.
+    
+            ==================================================
+            RESTAURANT RECEIPTS
+            ==================================================
+    
+            For receipts:
+    
+            Food items -> line_items
+    
+            Sales tax -> tax_amount
+    
+            Tip / Gratuity -> tip_amount
+    
+            Card authorization amount -> authorized_amount
+    
+            ==================================================
+            LINE ITEM EXTRACTION
+            ==================================================
+    
+            CRITICAL:
+    
+            Each JSON line item must represent ONE purchased item.
+    
+            Do NOT create line items from:
+    
+            - SKU codes
+            - product identifiers
+            - item numbers
+            - VAT rows
+            - totals
+            - footer text
+            - tax summaries
+            - account references
+    
+            ==================================================
+            MULTI-LINE DESCRIPTIONS
+            ==================================================
+    
+            Descriptions frequently span multiple OCR lines.
+    
+            Example:
+    
+            1.
+            Dell Optiplex 990 MT Computer
+            PC Quad Core i7 3.4GHz 16GB
+            2TB HD Windows 10 Pro
+    
+            This is ONE line item.
+    
+            Merge all continuation lines until the next item begins.
+    
+            ==================================================
+            TABLE INVOICES
+            ==================================================
+    
+            For table-style invoices:
+    
+            Rows often begin with:
+    
+            1.
+            2.
+            3.
+            4.
+    
+            These indicate actual invoice rows.
+    
+            Rules:
+    
+            - Each numbered row becomes exactly one JSON line item.
+            - Any following text belongs to that same row until the next row number appears.
+            - Do not split descriptions across multiple JSON items.
+            - If the invoice table has rows 1 through 7, return exactly 7 line_items.
+    
+            ==================================================
+            PRICE EXTRACTION
+            ==================================================
+    
+            Each line item should contain:
+    
+            description
+            quantity
+            unit_price
+            total
+    
+            Prefer:
+    
+            Net amount
+            Net worth
+            Line total
+    
+            over gross invoice totals.
+    
+            Invoice grand totals must NEVER become line item prices.
+    
+            ==================================================
+            PRODUCT CODES
+            ==================================================
+    
+            Examples:
+    
+            3G17-01G
+            CP0000036013454
+            ABC-123
+    
+            These are NOT line items.
+    
+            Attach them to the nearest product description if relevant.
+    
+            Never create standalone JSON items from product codes.
+    
+            ==================================================
+            VALIDATION RULES
+            ==================================================
+    
+            After extraction:
+    
+            1. Sum all line item totals.
+    
+            2. Compare with subtotal_amount.
+    
+            3. If discrepancy exceeds 5%:
+               - reconsider row grouping
+               - reconsider product code handling
+               - reconsider table reconstruction
+    
+            4. total_amount should approximately equal:
+    
+            subtotal_amount + tax_amount + tip_amount
+    
+            5. authorized_amount may be larger than total_amount if additional card charges appear.
+    
+            ==================================================
+            OCR NOISE
+            ==================================================
+    
+            Ignore:
+    
+            - page numbers
+            - headers
+            - footers
+            - website URLs
+            - barcode text
+            - tracking numbers
+            - document IDs not related to invoice number
+    
+            ==================================================
+            FINAL OUTPUT
+            ==================================================
+    
+            Return ONLY a JSON object matching the schema.
+    
+            No explanations.
+    
+            No markdown.
+    
+            No extra text.
+        """
+    
+        # Choose the exact schema based on file type
+        schema = """
+            {
+              "vendor_name": "String",
+              "invoice_date": "YYYY-MM-DD",
+              "invoice_number": "String",
+              "tax_id": "String or null",
+              "currency": "ISO Currency Code or null",
+              "payment_method": "String or null",
+              "subtotal_amount": Float,
+              "tax_amount": Float,
+              "tip_amount": Float,
+              "total_amount": Float,
+              "authorized_amount": Float,
+              "line_items": [
+                {
+                  "description": "String",
+                  "quantity": Float,
+                  "unit_price": Float,
+                  "total": Float
+                }
+              ]
+            }
         """
 
-        # Choose the exact schema based on file type
-        if is_pdf:
-            # Schema 2: The complex 10-field PDF prompt
-            schema = """
-            {
-                "vendor_name": "String",
-                "invoice_date": "YYYY-MM-DD",
-                "invoice_number": "String",
-                "tax_id": "String or null",
-                "payment_method": "String or null",
-                "subtotal_amount": Float,
-                "tax_amount": Float,
-                "tip_amount": Float,
-                "total_amount": Float,
-                "authorized_amount": Float,
-                "line_items": [
-                    {"description": "String", "quantity": Float, "unit_price": Float, "total": Float}
-                ]
-            }
-            """
-        else:
-            # Schema 1: The simpler 6-field Image prompt
-            schema = """
-            {
-                "vendor_name": "String",
-                "invoice_date": "YYYY-MM-DD",
-                "invoice_number": "String",
-                "tax_id": "String or null",
-                "total_amount": Float,
-                "line_items": [
-                    {"description": "String", "quantity": Float, "unit_price": Float, "total": Float}
-                ]
-            }
-            """
-
         prompt = f"""
-        {system_instruction}
-        
-        SCHEMA:
-        {schema}
-        
-        Raw OCR Text:
-        ---
-        {raw_text}
-        ---
+            {system_instruction}
+
+            EXTRA VALIDATION:
+
+            - Sum all line item totals.
+            - Compare against subtotal_amount.
+            - If mismatch > 5%, investigate alternative interpretation.
+            - Product codes are NOT line items.
+            - Tax amounts are NOT line items.
+            - Invoice totals are NOT line items.
+
+            SCHEMA:
+            {schema}
+
+            OCR TEXT:
+            {raw_text}
         """
         
         try:
@@ -287,9 +541,25 @@ class InvoicePipeline:
             return None
 
         parsed["ocr_confidence"] = round(ocr_conf, 4)
-        parsed["needs_review"] = ocr_conf < 0.75
-        return parsed
+        parsed["needs_review"] = bool(parsed.get("needs_review")) or ocr_conf < 0.75
 
+        line_sum = sum(
+            normalize_float(item.get("total"))
+        for item in parsed.get("line_items", [])
+        )
+
+        subtotal = normalize_float(parsed.get("subtotal_amount"))
+
+        if subtotal > 0:
+            diff = abs(line_sum - subtotal)
+
+            if diff > subtotal * 0.05:
+                parsed["needs_review"] = True
+                parsed["validation_error"] = (
+                    f"Line total mismatch: lines={line_sum}, subtotal={subtotal}"
+                )
+
+        return parsed
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process an invoice and extract data to JSON using PaddleOCR and Mistral AI.")
