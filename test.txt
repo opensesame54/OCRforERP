@@ -1,0 +1,30 @@
+| Field Label       | Field Name          | Type      |
+| ----------------- | ------------------- | --------- |
+| Vendor Name       | x_vendor_name       | Char      |
+| Invoice Number    | x_invoice_number    | Char      |
+| Invoice Date      | x_invoice_date      | Date      |
+| Tax ID            | x_tax_id            | Char      |
+| Payment Method    | x_payment_method    | Char      |
+| Subtotal Amount   | x_subtotal_amount   | Float     |
+| Tax Amount        | x_tax_amount        | Float     |
+| Total Amount      | x_total_amount      | Float     |
+| Authorized Amount | x_authorized_amount | Float     |
+| OCR Confidence    | x_ocr_confidence    | Float     |
+| Needs Review      | x_needs_review      | Boolean   |
+| Status            | x_status            | Selection |
+| OCR JSON          | x_json_payload      | Text      |
+| Error Message     | x_error_message     | Text      |
+
+draft
+approved
+posted
+failed
+duplicate
+
+| Field         | Type                        |
+| ------------- | --------------------------- |
+| x_invoice_id  | Many2one(x_invoice_staging) |
+| x_description | Char                        |
+| x_quantity    | Float                       |
+| x_unit_price  | Float                       |
+| x_total       | Float                       |
